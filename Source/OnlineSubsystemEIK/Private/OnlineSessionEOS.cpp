@@ -711,7 +711,7 @@ void FOnlineSessionEOS::OnLobbyUpdateReceived(const EOS_LobbyId& LobbyId)
 			EOS_EResult CopyInfoResult = EOS_LobbyDetails_CopyInfo(LobbyDetails->LobbyDetailsHandle, &CopyOptions, &LobbyDetailsInfo);
 			if (CopyInfoResult == EOS_EResult::EOS_Success)
 			{
-				CopyLobbyData(LobbyDetails, LobbyDetailsInfo, *Session, [this, SessionName = Session->SessionName, LobbyDetails](bool bWasSuccessful) {
+				CopyLobbyData(LobbyDetails, LobbyDetailsInfo, *Session, true, [this, SessionName = Session->SessionName, LobbyDetails](bool bWasSuccessful) {
 					if (bWasSuccessful)
 					{
 						if (FNamedOnlineSession* Session = GetNamedSession(SessionName))
@@ -4287,7 +4287,7 @@ void FOnlineSessionEOS::AddLobbySearchResult(const TSharedRef<FLobbyDetailsEOS>&
 
 		// We copy the lobby data and settings
 		LobbySearchResultsCache.Add(FString(LobbyDetailsInfo->LobbyId), LobbyDetails);
-		CopyLobbyData(LobbyDetails, LobbyDetailsInfo, SearchResult.Session, Callback);
+		CopyLobbyData(LobbyDetails, LobbyDetailsInfo, SearchResult.Session, false, Callback);
 
 		EOS_LobbyDetails_Info_Release(LobbyDetailsInfo);
 
@@ -4301,7 +4301,7 @@ void FOnlineSessionEOS::AddLobbySearchResult(const TSharedRef<FLobbyDetailsEOS>&
 	}
 }
 
-void FOnlineSessionEOS::CopyLobbyData(const TSharedRef<FLobbyDetailsEOS>& LobbyDetails, EOS_LobbyDetails_Info* LobbyDetailsInfo, FOnlineSession& OutSession, const FOnCopyLobbyDataCompleteCallback& Callback)
+void FOnlineSessionEOS::CopyLobbyData(const TSharedRef<FLobbyDetailsEOS>& LobbyDetails, EOS_LobbyDetails_Info* LobbyDetailsInfo, FOnlineSession& OutSession, bool bCopyMemberData, const FOnCopyLobbyDataCompleteCallback& Callback)
 {
 	OutSession.SessionSettings.bUseLobbiesIfAvailable = true;
 	OutSession.SessionSettings.bIsLANMatch = false;
@@ -4336,53 +4336,84 @@ void FOnlineSessionEOS::CopyLobbyData(const TSharedRef<FLobbyDetailsEOS>& LobbyD
 	// We copy the settings related to lobby attributes
 	CopyLobbyAttributes(LobbyDetails, OutSession);
 
-	// Then we copy the settings for all lobby members
-	EOS_LobbyDetails_GetMemberCountOptions CountOptions = { };
-	CountOptions.ApiVersion = EOS_LOBBYDETAILS_GETMEMBERCOUNT_API_LATEST;
-	int32 Count = EOS_LobbyDetails_GetMemberCount(LobbyDetails->LobbyDetailsHandle, &CountOptions);
-
-	TArray<EOS_ProductUserId> TargetUserIds;
-	TargetUserIds.Reserve(Count);
-
-	EOS_LobbyDetails_GetLobbyOwnerOptions GetLobbyOwnerOptions = {};
-	GetLobbyOwnerOptions.ApiVersion = EOS_LOBBYDETAILS_GETLOBBYOWNER_API_LATEST;
-	EOS_ProductUserId OwnerID = EOS_LobbyDetails_GetLobbyOwner(LobbyDetails->LobbyDetailsHandle, &GetLobbyOwnerOptions);
-	TargetUserIds.Add(OwnerID);
-	for (int32 Index = 0; Index < Count; Index++)
+	if (bCopyMemberData)
 	{
-		EOS_LobbyDetails_GetMemberByIndexOptions GetMemberByIndexOptions = { };
-		GetMemberByIndexOptions.ApiVersion = EOS_LOBBYDETAILS_GETMEMBERBYINDEX_API_LATEST;
-		GetMemberByIndexOptions.MemberIndex = Index;
-		
-		EOS_ProductUserId TargetUserId = EOS_LobbyDetails_GetMemberByIndex(LobbyDetails->LobbyDetailsHandle, &GetMemberByIndexOptions);
-		if(TargetUserId == OwnerID || TargetUserId == nullptr || TargetUserId == EOS_ProductUserId())
+		// Then we copy the settings for all lobby members
+		EOS_LobbyDetails_GetMemberCountOptions CountOptions = { };
+		CountOptions.ApiVersion = EOS_LOBBYDETAILS_GETMEMBERCOUNT_API_LATEST;
+		int32 Count = EOS_LobbyDetails_GetMemberCount(LobbyDetails->LobbyDetailsHandle, &CountOptions);
+
+		TArray<EOS_ProductUserId> TargetUserIds;
+		TargetUserIds.Reserve(Count);
+
+		EOS_LobbyDetails_GetLobbyOwnerOptions GetLobbyOwnerOptions = {};
+		GetLobbyOwnerOptions.ApiVersion = EOS_LOBBYDETAILS_GETLOBBYOWNER_API_LATEST;
+		EOS_ProductUserId OwnerID = EOS_LobbyDetails_GetLobbyOwner(LobbyDetails->LobbyDetailsHandle, &GetLobbyOwnerOptions);
+		TargetUserIds.Add(OwnerID);
+		for (int32 Index = 0; Index < Count; Index++)
 		{
-			continue;
+			EOS_LobbyDetails_GetMemberByIndexOptions GetMemberByIndexOptions = { };
+			GetMemberByIndexOptions.ApiVersion = EOS_LOBBYDETAILS_GETMEMBERBYINDEX_API_LATEST;
+			GetMemberByIndexOptions.MemberIndex = Index;
+		
+			EOS_ProductUserId TargetUserId = EOS_LobbyDetails_GetMemberByIndex(LobbyDetails->LobbyDetailsHandle, &GetMemberByIndexOptions);
+			if(TargetUserId == OwnerID || TargetUserId == nullptr || TargetUserId == EOS_ProductUserId())
+			{
+				continue;
+			}
+			TargetUserIds.Add(TargetUserId);
 		}
-		TargetUserIds.Add(TargetUserId);
-	}
 
-	if (!TargetUserIds.IsEmpty())
+		if (!TargetUserIds.IsEmpty())
+		{
+			EOSSubsystem->UserManager->ResolveUniqueNetIds(TargetUserIds, [this, LobbyDetails, LobbyId = FUniqueNetIdEOSLobby::Create(LobbyDetailsInfo->LobbyId), OriginalCallback = Callback](TMap<EOS_ProductUserId, FUniqueNetIdEOSRef> ResolvedUniqueNetIds)
+				{
+					FOnlineSession* Session = GetOnlineSessionFromLobbyId(*LobbyId);
+					if (Session)
+					{
+						for (TMap<EOS_ProductUserId, FUniqueNetIdEOSRef>::TConstIterator It(ResolvedUniqueNetIds); It; ++It)
+						{
+							FSessionSettings& MemberSettings = Session->SessionSettings.MemberSettings.FindOrAdd(It.Value());
+
+							CopyLobbyMemberAttributes(*LobbyDetails, It.Key(), MemberSettings);
+						}
+					}
+
+					const bool bWasSuccessful = Session != nullptr;
+					OriginalCallback(bWasSuccessful);
+				});
+		}
+		else
+		{
+			Callback(true);
+		}
+	}
+	else
 	{
-		EOSSubsystem->UserManager->ResolveUniqueNetIds(TargetUserIds, [this, LobbyDetails, LobbyId = FUniqueNetIdEOSLobby::Create(LobbyDetailsInfo->LobbyId), OriginalCallback = Callback](TMap<EOS_ProductUserId, FUniqueNetIdEOSRef> ResolvedUniqueNetIds)
+		EOS_LobbyDetails_GetLobbyOwnerOptions GetLobbyOwnerOptions = {};
+		GetLobbyOwnerOptions.ApiVersion = EOS_LOBBYDETAILS_GETLOBBYOWNER_API_LATEST;
+		
+		TArray<EOS_ProductUserId> TargetUserIds;
+		TargetUserIds.Add(TArray<EOS_ProductUserIdDetails*>::ElementType(EOSSubsystem->UserManager->GetDefaultLocalUser()));
+		const EOS_ProductUserId LobbyOwner = EOS_LobbyDetails_GetLobbyOwner(LobbyDetails->LobbyDetailsHandle, &GetLobbyOwnerOptions);
+
+		EOSSubsystem->UserManager->ResolveUniqueNetIds(TargetUserIds, [this, LobbyOwner, LobbyDetails, LobbyId = FUniqueNetIdEOSLobby::Create(UTF8_TO_TCHAR(LobbyDetailsInfo->LobbyId)), OriginalCallback = Callback](TMap<EOS_ProductUserId, FUniqueNetIdEOSRef> ResolvedUniqueNetIds)
 			{
 				FOnlineSession* Session = GetOnlineSessionFromLobbyId(*LobbyId);
 				if (Session)
 				{
-					for (TMap<EOS_ProductUserId, FUniqueNetIdEOSRef>::TConstIterator It(ResolvedUniqueNetIds); It; ++It)
+					FUniqueNetIdEOSRef* OwnerNetId = ResolvedUniqueNetIds.Find(LobbyOwner);
+					if (ensure(OwnerNetId))
 					{
-						FSessionSettings& MemberSettings = Session->SessionSettings.MemberSettings.FindOrAdd(It.Value());
-
-						CopyLobbyMemberAttributes(*LobbyDetails, It.Key(), MemberSettings);
+						Session->OwningUserId = *OwnerNetId;
+						Session->OwningUserName = EOSSubsystem->UserManager->GetPlayerNickname(**OwnerNetId);
 					}
 				}
 
 				const bool bWasSuccessful = Session != nullptr;
 				OriginalCallback(bWasSuccessful);
 			});
-	}
-	else
-	{
+
 		Callback(true);
 	}
 }
